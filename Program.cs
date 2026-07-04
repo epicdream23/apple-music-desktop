@@ -32,6 +32,7 @@ class WindowSettings
     public int W { get; set; }
     public int H { get; set; }
     public bool Max { get; set; }
+    public bool Pin { get; set; }
 }
 
 class MainForm : Form
@@ -112,6 +113,7 @@ class MainForm : Form
                     Text = string.IsNullOrWhiteSpace(t) ? "Apple Music" : t;
                 };
                 cw.ContainsFullScreenElementChanged += (_, _) => SetFullscreen(cw.ContainsFullScreenElement);
+                cw.NavigationCompleted += (_, _) => { SyncPinToPage(); _sentMaxState = false; SyncMaxStateToPage(); };
                 cw.WebMessageReceived += OnWebMessage;
                 cw.NewWindowRequested += (_, e) =>
                 {
@@ -195,6 +197,10 @@ class MainForm : Form
             case "close":
                 Close();
                 break;
+            case "pin":
+                TopMost = !TopMost;
+                SyncPinToPage();
+                break;
             case "menu":
                 ShowSystemMenuAtCursor();
                 break;
@@ -206,6 +212,10 @@ class MainForm : Form
 
     void ToggleMaximize() =>
         WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+
+    void SyncPinToPage() =>
+        _ = _web?.CoreWebView2?.ExecuteScriptAsync(
+            $"window.__amSetPinned && window.__amSetPinned({(TopMost ? "true" : "false")})");
 
     void ShowSystemMenuAtCursor()
     {
@@ -244,6 +254,7 @@ class MainForm : Form
                     StartPosition = FormStartPosition.Manual;
                     Bounds = r;
                     if (s.Max) WindowState = FormWindowState.Maximized;
+                    TopMost = s.Pin;
                     return;
                 }
             }
@@ -263,7 +274,7 @@ class MainForm : Form
                   : WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
             bool max = _fullscreen ? _wasMaximized : WindowState == FormWindowState.Maximized;
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(
-                new WindowSettings { X = b.X, Y = b.Y, W = b.Width, H = b.Height, Max = max }));
+                new WindowSettings { X = b.X, Y = b.Y, W = b.Width, H = b.Height, Max = max, Pin = TopMost }));
         }
         catch { }
     }
@@ -381,6 +392,7 @@ class MainForm : Form
             'filter:drop-shadow(0 1px 2px rgba(0,0,0,.4));}' +
             '.amg-b:hover{background:rgba(255,255,255,.24);}' +
             '.amg-b:active{background:rgba(255,255,255,.15);}' +
+            '.amg-b.amg-on{background:rgba(255,255,255,.30);box-shadow:inset 0 1px 0 rgba(255,255,255,.28);}' +
             '.amg-b.amg-close:hover{background:rgba(255,69,58,.92);}' +
             '.amg-b.amg-close:active{background:rgba(205,54,45,.95);}' +
 
@@ -394,6 +406,12 @@ class MainForm : Form
         root.innerHTML =
             '<div id="amg-strip"></div>' +
             '<div class="amg-cap" id="amg-right">' +
+              '<button class="amg-b" id="amg-pin" title="Immer im Vordergrund" tabindex="-1">' +
+                '<svg width="12" height="12" viewBox="0 0 12 12">' +
+                  '<path d="M6 1.4 a2.3 2.3 0 0 1 2.3 2.3 c0 1.5 -1.1 2 -1.1 3.1 h-2.4 c0 -1.1 -1.1 -1.6 -1.1 -3.1 A2.3 2.3 0 0 1 6 1.4 z"/>' +
+                  '<path d="M6 6.8 v3.8"/>' +
+                '</svg>' +
+              '</button>' +
               '<button class="amg-b" id="amg-min" title="Minimieren" tabindex="-1">' +
                 '<svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 6 h8"/></svg>' +
               '</button>' +
@@ -424,6 +442,7 @@ class MainForm : Form
             post('menu');
         });
 
+        document.getElementById('amg-pin').addEventListener('click', function () { post('pin'); });
         document.getElementById('amg-min').addEventListener('click', function () { post('minimize'); });
         document.getElementById('amg-max').addEventListener('click', function () { post('maximize'); });
         document.getElementById('amg-close').addEventListener('click', function () { post('close'); });
@@ -438,6 +457,13 @@ class MainForm : Form
         };
         window.__amSetVisible = function (v) {
             root.style.display = v ? '' : 'none';
+        };
+        window.__amSetPinned = function (v) {
+            var b = document.getElementById('amg-pin');
+            if (b) {
+                b.classList.toggle('amg-on', !!v);
+                b.title = v ? 'Nicht mehr im Vordergrund halten' : 'Immer im Vordergrund';
+            }
         };
 
         // dynamic position: dodge page icons that live in the top-right corner.
