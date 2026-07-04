@@ -91,7 +91,17 @@ class MainForm : Form
         {
             try
             {
-                var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(DataDir, "WebView2"));
+                // never background-throttle: without these, Chromium's window occlusion
+                // tracking misreads the frameless window and caps rendering like an
+                // inactive browser tab (fullscreen bypassed it, windowed mode didn't)
+                var opts = new CoreWebView2EnvironmentOptions
+                {
+                    AdditionalBrowserArguments =
+                        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling " +
+                        "--disable-backgrounding-occluded-windows --disable-background-timer-throttling " +
+                        "--disable-renderer-backgrounding"
+                };
+                var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(DataDir, "WebView2"), opts);
                 await _web.EnsureCoreWebView2Async(env);
                 var cw = _web.CoreWebView2;
                 cw.Settings.IsStatusBarEnabled = false;
@@ -450,44 +460,36 @@ class MainForm : Form
             return true;
         }
 
-        function onTop(el, rc) {
-            // is this element what the user would actually see/click at that spot,
-            // or is it buried under an overlay (fullscreen lyrics, modals, ...)?
-            var x = Math.min(Math.max(rc.left + rc.width / 2, 0), window.innerWidth - 1);
-            var y = Math.min(Math.max(rc.top + rc.height / 2, 0), window.innerHeight - 1);
-            var hit = document.elementFromPoint(x, y);
-            return !!hit && (hit === el || el.contains(hit) || hit.contains(el));
-        }
-
         function scan() {
             scanQueued = false;
             lastScan = performance.now();
             if (!cap || !cap.isConnected || document.hidden) return;
-            if (performance.now() - lastScroll < 250) return; // hold still while scrolling
+            if (root.style.display === 'none') return;              // hidden (video fullscreen)
+            if (performance.now() - lastScroll < 250) return;       // hold still while scrolling
             var W = window.innerWidth;
-            var cands = [];
-            var els = document.querySelectorAll('button, a, [role="button"]');
-            for (var i = 0; i < els.length; i++) {
-                var el = els[i];
-                if (root.contains(el)) continue;
-                var rc = el.getBoundingClientRect();
-                if (rc.width < 5 || rc.height < 5) continue;         // collapsed
-                if (rc.width > 220 || rc.height > 56) continue;      // not icon-sized
-                if (rc.top < -5 || rc.bottom > 68) continue;         // outside the top strip
-                if (rc.right < W - 260) continue;                    // not near the right edge
-                if (!reallyVisible(el)) continue;                    // opacity-0 hover controls
-                cands.push([el, rc]);
-            }
             var minLeft = Infinity;
-            if (cands.length) {
-                root.style.pointerEvents = 'none'; // don't let the capsule swallow the hit-test
-                try {
-                    for (var j = 0; j < cands.length; j++)
-                        if (onTop(cands[j][0], cands[j][1]) && cands[j][1].left < minLeft)
-                            minLeft = cands[j][1].left;
-                } finally {
-                    root.style.pointerEvents = '';
+            // cheap region probe: hit-test a small grid of points in the top-right strip
+            // instead of walking the whole DOM. elementFromPoint only ever returns what
+            // is actually on top, so overlays and occlusion are handled for free.
+            root.style.pointerEvents = 'none'; // don't let the capsule swallow the hit-test
+            try {
+                for (var row = 0; row < 2; row++) {
+                    var py = row === 0 ? 22 : 48;
+                    for (var px = W - 24; px >= W - 240; px -= 36) {
+                        var hit = document.elementFromPoint(px, py);
+                        if (!hit || root.contains(hit) || !hit.closest) continue;
+                        var btn = hit.closest('button, a, [role="button"]');
+                        if (!btn) continue;
+                        var rc = btn.getBoundingClientRect();
+                        if (rc.width < 5 || rc.height < 5) continue;         // collapsed
+                        if (rc.width > 220 || rc.height > 56) continue;      // not icon-sized
+                        if (rc.top < -5 || rc.bottom > 68) continue;         // outside the top strip
+                        if (!reallyVisible(btn)) continue;                   // opacity-0 hover controls
+                        if (rc.left < minLeft) minLeft = rc.left;
+                    }
                 }
+            } finally {
+                root.style.pointerEvents = '';
             }
             var off = 0;
             if (minLeft !== Infinity)

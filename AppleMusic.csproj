@@ -17,7 +17,7 @@
     <DebugType>none</DebugType>
     <AssemblyTitle>Apple Music</AssemblyTitle>
     <Product>Apple Music Web Player</Product>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
