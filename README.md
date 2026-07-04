@@ -16,6 +16,8 @@ No browser tabs, no URL bar, no clutter. Just music.
 - 🎬 Proper fullscreen for music videos and fullscreen lyrics
 - 💾 Remembers window size/position; login persists between launches
 - 🔐 DRM playback works (WebView2 = Chromium/Edge engine), Apple ID login popups stay in-app, external links open in your default browser
+- 🎮 **Discord Rich Presence** — "Listening to Apple Music" with song title, artist, album art, live progress bar and an "In Apple Music ansehen" button (the *Listen Along* button is a Spotify-exclusive partner feature and not available to third-party apps)
+- 📌 Pin button to keep the window always on top (also bypasses driver background-fps caps)
 - 📦 Single ~1 MB exe (framework-dependent)
 
 ## Requirements
@@ -45,6 +47,10 @@ The single-file exe lands in `dist/`. Requires the .NET 8 SDK (or newer).
 - **Glass look**: all capsule styling lives in the injected CSS inside the `GlassScript`
   string in [`Program.cs`](Program.cs) — blur strength, tint, sizes and the dodge
   animation curve are plain CSS values.
+- **Discord presence**: enabled by default when Discord is running. To turn it off, set
+  `"DiscordRpc": false` in `%LOCALAPPDATA%\AppleMusicPlayer\window.json` (created after
+  the first run). You can also point `"DiscordClientId"` at your own Discord application
+  if you want a custom activity name.
 
 ## How it works
 

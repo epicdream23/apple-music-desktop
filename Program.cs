@@ -1,10 +1,15 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -33,6 +38,8 @@ class WindowSettings
     public int H { get; set; }
     public bool Max { get; set; }
     public bool Pin { get; set; }
+    public bool DiscordRpc { get; set; } = true;
+    public string DiscordClientId { get; set; }
 }
 
 class MainForm : Form
@@ -44,7 +51,15 @@ class MainForm : Form
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AppleMusicPlayer");
     static readonly string SettingsPath = Path.Combine(DataDir, "window.json");
 
+    // public Discord application id that displays as "Apple Music" (same one the
+    // AMWin-RP project uses); override via DiscordClientId in window.json
+    const string DefaultDiscordClientId = "1066220978406953012";
+
     WebView2 _web;
+    WindowSettings _settings = new();
+    DiscordRpc _rpc;
+    string _lastRpcKey;
+    long _lastRpcStartMs;
     bool _fullscreen;
     Rectangle _restoreBounds;
     bool _wasMaximized;
@@ -84,6 +99,10 @@ class MainForm : Form
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
         ApplySavedBounds();
+
+        if (_settings.DiscordRpc)
+            _rpc = new DiscordRpc(string.IsNullOrWhiteSpace(_settings.DiscordClientId)
+                ? DefaultDiscordClientId : _settings.DiscordClientId);
 
         _web = new WebView2 { DefaultBackgroundColor = Color.FromArgb(24, 24, 28) };
         Controls.Add(_web);
@@ -186,6 +205,7 @@ class MainForm : Form
     {
         string msg;
         try { msg = e.TryGetWebMessageAsString(); } catch { return; }
+        if (msg.Length > 0 && msg[0] == '{') { HandleNowPlaying(msg); return; }
         switch (msg)
         {
             case "minimize":
@@ -208,6 +228,40 @@ class MainForm : Form
                 HandleDragMessage();
                 break;
         }
+    }
+
+    void HandleNowPlaying(string json)
+    {
+        if (_rpc == null) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var r = doc.RootElement;
+            if (!r.TryGetProperty("rpc", out _)) return;
+
+            string Str(string name) => r.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+            double Num(string name) => r.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : 0;
+
+            bool playing = r.TryGetProperty("playing", out var p) && p.ValueKind == JsonValueKind.True;
+            string title = Str("title");
+            if (!playing || string.IsNullOrWhiteSpace(title))
+            {
+                if (_lastRpcKey != null) { _lastRpcKey = null; _rpc.Clear(); }
+                return;
+            }
+
+            string artist = Str("artist"), album = Str("album"), art = Str("art"), url = Str("url");
+            double duration = Num("duration"), position = Num("position");
+            string key = title + "\n" + artist + "\n" + album;
+            long startMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)(position * 1000);
+
+            // same song, no seek (start drift < 3 s) -> nothing changed, skip the resync
+            if (key == _lastRpcKey && Math.Abs(startMs - _lastRpcStartMs) < 3000) return;
+            _lastRpcKey = key;
+            _lastRpcStartMs = startMs;
+            _rpc.SetListening(title, artist, album, art, url, duration, position);
+        }
+        catch { }
     }
 
     void ToggleMaximize() =>
@@ -247,6 +301,7 @@ class MainForm : Form
             if (File.Exists(SettingsPath))
             {
                 var s = JsonSerializer.Deserialize<WindowSettings>(File.ReadAllText(SettingsPath));
+                _settings = s;
                 var r = new Rectangle(s.X, s.Y, s.W, s.H);
                 if (r.Width >= 480 && r.Height >= 360 &&
                     Screen.AllScreens.Any(sc => sc.WorkingArea.IntersectsWith(r)))
@@ -274,9 +329,14 @@ class MainForm : Form
                   : WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
             bool max = _fullscreen ? _wasMaximized : WindowState == FormWindowState.Maximized;
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(
-                new WindowSettings { X = b.X, Y = b.Y, W = b.Width, H = b.Height, Max = max, Pin = TopMost }));
+                new WindowSettings
+                {
+                    X = b.X, Y = b.Y, W = b.Width, H = b.Height, Max = max, Pin = TopMost,
+                    DiscordRpc = _settings.DiscordRpc, DiscordClientId = _settings.DiscordClientId
+                }));
         }
         catch { }
+        _rpc?.Dispose();
     }
 
     // ---------- fullscreen (for videos) ----------
@@ -575,6 +635,191 @@ class MainForm : Form
         document.addEventListener('DOMContentLoaded', build);
     else
         build();
+
+    // ---- now playing -> Discord rich presence (via host) ----
+    function initRpc() {
+        var mk = null;
+        try { mk = window.MusicKit && window.MusicKit.getInstance ? window.MusicKit.getInstance() : null; } catch (e) { }
+        if (!mk) { setTimeout(initRpc, 3000); return; }
+        var send = function () {
+            try {
+                var item = mk.nowPlayingItem;
+                var a = (item && item.attributes) || {};
+                window.chrome.webview.postMessage(JSON.stringify({
+                    rpc: 1,
+                    playing: !!mk.isPlaying,
+                    title: a.name || '',
+                    artist: a.artistName || '',
+                    album: a.albumName || '',
+                    url: a.url || '',
+                    duration: a.durationInMillis ? a.durationInMillis / 1000 : 0,
+                    position: mk.currentPlaybackTime || 0,
+                    art: (a.artwork && a.artwork.url)
+                        ? a.artwork.url.replace('{w}', '512').replace('{h}', '512') : ''
+                }));
+            } catch (e) { }
+        };
+        try {
+            mk.addEventListener('playbackStateDidChange', send);
+            mk.addEventListener('nowPlayingItemDidChange', send);
+        } catch (e) { }
+        setInterval(send, 15000); // periodic position resync (catches seeks)
+        send();
+    }
+    initRpc();
 })();
 """;
+}
+
+// Minimal Discord Rich Presence client over the local IPC named pipe.
+class DiscordRpc : IDisposable
+{
+    readonly string _clientId;
+    readonly object _sync = new();
+    NamedPipeClientStream _pipe;
+    long _lastConnectAttempt = -60000;
+    long _seq;
+    volatile bool _disposed;
+
+    public DiscordRpc(string clientId) => _clientId = clientId;
+
+    static void WriteFrame(Stream s, int op, string json)
+    {
+        var payload = Encoding.UTF8.GetBytes(json);
+        var buf = new byte[8 + payload.Length];
+        BitConverter.GetBytes(op).CopyTo(buf, 0);
+        BitConverter.GetBytes(payload.Length).CopyTo(buf, 4);
+        payload.CopyTo(buf, 8);
+        s.Write(buf, 0, buf.Length);
+        s.Flush();
+    }
+
+    static string ReadFrame(Stream s)
+    {
+        var hdr = ReadExact(s, 8);
+        int len = BitConverter.ToInt32(hdr, 4);
+        if (len < 0 || len > (1 << 20)) throw new IOException("bad frame");
+        return Encoding.UTF8.GetString(ReadExact(s, len));
+    }
+
+    static byte[] ReadExact(Stream s, int n)
+    {
+        var buf = new byte[n];
+        int off = 0;
+        while (off < n)
+        {
+            int r = s.Read(buf, off, n - off);
+            if (r <= 0) throw new IOException("pipe closed");
+            off += r;
+        }
+        return buf;
+    }
+
+    bool EnsureConnected()
+    {
+        if (_pipe is { IsConnected: true }) return true;
+        long now = Environment.TickCount64;
+        if (now - _lastConnectAttempt < 15000) return false; // retry cooldown
+        _lastConnectAttempt = now;
+        _pipe?.Dispose();
+        _pipe = null;
+        for (int i = 0; i < 10 && !_disposed; i++)
+        {
+            NamedPipeClientStream p = null;
+            try
+            {
+                p = new NamedPipeClientStream(".", "discord-ipc-" + i, PipeDirection.InOut);
+                p.Connect(200);
+                WriteFrame(p, 0, JsonSerializer.Serialize(new { v = 1, client_id = _clientId }));
+                ReadFrame(p); // READY dispatch
+                _pipe = p;
+                var captured = p;
+                Task.Run(() => Drain(captured)); // discard responses so the pipe never clogs
+                return true;
+            }
+            catch { p?.Dispose(); }
+        }
+        return false;
+    }
+
+    void Drain(NamedPipeClientStream p)
+    {
+        try { while (true) ReadFrame(p); } catch { }
+        lock (_sync) { if (_pipe == p) _pipe = null; }
+        try { p.Dispose(); } catch { }
+    }
+
+    void Send(long seq, Func<object> payload)
+    {
+        lock (_sync)
+        {
+            if (_disposed || seq != Interlocked.Read(ref _seq)) return; // superseded
+            if (!EnsureConnected()) return;
+            try { WriteFrame(_pipe, 1, JsonSerializer.Serialize(payload())); }
+            catch
+            {
+                try { _pipe?.Dispose(); } catch { }
+                _pipe = null;
+            }
+        }
+    }
+
+    static string Cap(string s, int n) =>
+        string.IsNullOrEmpty(s) ? null : (s.Length <= n ? s : s.Substring(0, n));
+
+    public void SetListening(string title, string artist, string album, string art, string url,
+                             double durationSec, double positionSec)
+    {
+        long seq = Interlocked.Increment(ref _seq);
+        long startMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)(positionSec * 1000);
+        Task.Run(() => Send(seq, () =>
+        {
+            string details = Cap(title, 128);
+            if (details.Length < 2) details += "  "; // Discord requires >= 2 chars
+            var activity = new Dictionary<string, object> { ["type"] = 2, ["details"] = details };
+            var state = Cap(artist, 128);
+            if (state != null) activity["state"] = state;
+            var ts = new Dictionary<string, object> { ["start"] = startMs };
+            if (durationSec > 1) ts["end"] = startMs + (long)(durationSec * 1000);
+            activity["timestamps"] = ts;
+            var assets = new Dictionary<string, object>();
+            var artUrl = Cap(art, 256);
+            if (artUrl != null) assets["large_image"] = artUrl;
+            var albumText = Cap(album, 128);
+            if (albumText is { Length: >= 2 }) assets["large_text"] = albumText;
+            if (assets.Count > 0) activity["assets"] = assets;
+            if (url != null && url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                activity["buttons"] = new[]
+                {
+                    new Dictionary<string, object> { ["label"] = "In Apple Music ansehen", ["url"] = Cap(url, 512) }
+                };
+            return new
+            {
+                cmd = "SET_ACTIVITY",
+                args = new { pid = Environment.ProcessId, activity },
+                nonce = seq.ToString()
+            };
+        }));
+    }
+
+    public void Clear()
+    {
+        long seq = Interlocked.Increment(ref _seq);
+        Task.Run(() => Send(seq, () => (object)new
+        {
+            cmd = "SET_ACTIVITY",
+            args = new { pid = Environment.ProcessId },
+            nonce = seq.ToString()
+        }));
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        lock (_sync)
+        {
+            try { _pipe?.Dispose(); } catch { }
+            _pipe = null;
+        }
+    }
 }
