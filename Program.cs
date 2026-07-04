@@ -676,12 +676,19 @@ class DiscordRpc : IDisposable
 {
     readonly string _clientId;
     readonly object _sync = new();
+    readonly System.Threading.Timer _timer;
     NamedPipeClientStream _pipe;
+    Dictionary<string, object> _lastActivity;
     long _lastConnectAttempt = -60000;
     long _seq;
     volatile bool _disposed;
 
-    public DiscordRpc(string clientId) => _clientId = clientId;
+    public DiscordRpc(string clientId)
+    {
+        _clientId = clientId;
+        // if Discord (re)starts later, reconnect and restore the last activity
+        _timer = new System.Threading.Timer(_ => Heartbeat(), null, 5000, 20000);
+    }
 
     static void WriteFrame(Stream s, int op, string json)
     {
@@ -749,13 +756,42 @@ class DiscordRpc : IDisposable
         try { p.Dispose(); } catch { }
     }
 
-    void Send(long seq, Func<object> payload)
+    void Send(long seq, Dictionary<string, object> activity)
     {
         lock (_sync)
         {
             if (_disposed || seq != Interlocked.Read(ref _seq)) return; // superseded
+            _lastActivity = activity;
             if (!EnsureConnected()) return;
-            try { WriteFrame(_pipe, 1, JsonSerializer.Serialize(payload())); }
+            try { WriteFrame(_pipe, 1, BuildSetActivity(activity)); }
+            catch
+            {
+                try { _pipe?.Dispose(); } catch { }
+                _pipe = null;
+            }
+        }
+    }
+
+    static string BuildSetActivity(Dictionary<string, object> activity)
+    {
+        var args = new Dictionary<string, object> { ["pid"] = Environment.ProcessId };
+        if (activity != null) args["activity"] = activity;
+        return JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["cmd"] = "SET_ACTIVITY",
+            ["args"] = args,
+            ["nonce"] = Guid.NewGuid().ToString()
+        });
+    }
+
+    void Heartbeat()
+    {
+        lock (_sync)
+        {
+            if (_disposed || _lastActivity == null) return;
+            if (_pipe is { IsConnected: true }) return; // healthy
+            if (!EnsureConnected()) return;
+            try { WriteFrame(_pipe, 1, BuildSetActivity(_lastActivity)); }
             catch
             {
                 try { _pipe?.Dispose(); } catch { }
@@ -772,50 +808,38 @@ class DiscordRpc : IDisposable
     {
         long seq = Interlocked.Increment(ref _seq);
         long startMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)(positionSec * 1000);
-        Task.Run(() => Send(seq, () =>
-        {
-            string details = Cap(title, 128);
-            if (details.Length < 2) details += "  "; // Discord requires >= 2 chars
-            var activity = new Dictionary<string, object> { ["type"] = 2, ["details"] = details };
-            var state = Cap(artist, 128);
-            if (state != null) activity["state"] = state;
-            var ts = new Dictionary<string, object> { ["start"] = startMs };
-            if (durationSec > 1) ts["end"] = startMs + (long)(durationSec * 1000);
-            activity["timestamps"] = ts;
-            var assets = new Dictionary<string, object>();
-            var artUrl = Cap(art, 256);
-            if (artUrl != null) assets["large_image"] = artUrl;
-            var albumText = Cap(album, 128);
-            if (albumText is { Length: >= 2 }) assets["large_text"] = albumText;
-            if (assets.Count > 0) activity["assets"] = assets;
-            if (url != null && url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-                activity["buttons"] = new[]
-                {
-                    new Dictionary<string, object> { ["label"] = "In Apple Music ansehen", ["url"] = Cap(url, 512) }
-                };
-            return new
+        string details = Cap(title, 128);
+        if (details.Length < 2) details += "  "; // Discord requires >= 2 chars
+        var activity = new Dictionary<string, object> { ["type"] = 2, ["details"] = details };
+        var state = Cap(artist, 128);
+        if (state != null) activity["state"] = state;
+        var ts = new Dictionary<string, object> { ["start"] = startMs };
+        if (durationSec > 1) ts["end"] = startMs + (long)(durationSec * 1000);
+        activity["timestamps"] = ts;
+        var assets = new Dictionary<string, object>();
+        var artUrl = Cap(art, 256);
+        if (artUrl != null) assets["large_image"] = artUrl;
+        var albumText = Cap(album, 128);
+        if (albumText is { Length: >= 2 }) assets["large_text"] = albumText;
+        if (assets.Count > 0) activity["assets"] = assets;
+        if (url != null && url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            activity["buttons"] = new[]
             {
-                cmd = "SET_ACTIVITY",
-                args = new { pid = Environment.ProcessId, activity },
-                nonce = seq.ToString()
+                new Dictionary<string, object> { ["label"] = "In Apple Music ansehen", ["url"] = Cap(url, 512) }
             };
-        }));
+        Task.Run(() => Send(seq, activity));
     }
 
     public void Clear()
     {
         long seq = Interlocked.Increment(ref _seq);
-        Task.Run(() => Send(seq, () => (object)new
-        {
-            cmd = "SET_ACTIVITY",
-            args = new { pid = Environment.ProcessId },
-            nonce = seq.ToString()
-        }));
+        Task.Run(() => Send(seq, null));
     }
 
     public void Dispose()
     {
         _disposed = true;
+        _timer?.Dispose();
         lock (_sync)
         {
             try { _pipe?.Dispose(); } catch { }
