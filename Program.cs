@@ -45,7 +45,8 @@ class WindowSettings
 class MainForm : Form
 {
     const string HomeUrl = "https://music.apple.com/de/home";
-    const int TopStripLogical = 3; // slim strip above the webview, used as the top resize grip
+    const int TopStripLogical = 5; // slim host-owned strip above the webview: native drag/menu handle
+                                   // that keeps working even if the page breaks the injected controls
 
     static readonly string DataDir =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AppleMusicPlayer");
@@ -68,7 +69,8 @@ class MainForm : Form
     Point _lastDragPos;
 
     // ---- Win32 ----
-    const int WM_NCCALCSIZE = 0x0083, WM_NCHITTEST = 0x0084, WM_NCLBUTTONDOWN = 0x00A1, WM_SYSCOMMAND = 0x0112;
+    const int WM_NCCALCSIZE = 0x0083, WM_NCHITTEST = 0x0084, WM_NCLBUTTONDOWN = 0x00A1,
+              WM_NCRBUTTONUP = 0x00A5, WM_SYSCOMMAND = 0x0112;
     const int HTCLIENT = 1, HTCAPTION = 2, HTTOP = 12, HTTOPLEFT = 13, HTTOPRIGHT = 14;
     const int SM_CYSIZEFRAME = 33, SM_CXPADDEDBORDER = 92;
     const int DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2;
@@ -134,6 +136,7 @@ class MainForm : Form
                 cw.ContainsFullScreenElementChanged += (_, _) => SetFullscreen(cw.ContainsFullScreenElement);
                 cw.NavigationCompleted += (_, _) => { SyncPinToPage(); _sentMaxState = false; SyncMaxStateToPage(); };
                 cw.WebMessageReceived += OnWebMessage;
+                cw.ProcessFailed += (_, _) => { try { cw.Reload(); } catch { } };
                 cw.NewWindowRequested += (_, e) =>
                 {
                     // keep Apple login/checkout popups inside; send everything else to the default browser
@@ -148,6 +151,20 @@ class MainForm : Form
                 };
                 await cw.AddScriptToExecuteOnDocumentCreatedAsync(GlassScript);
                 cw.Navigate(HomeUrl);
+
+                // watchdog: heal fullscreen desyncs and keep the injected controls alive
+                var watchdog = new System.Windows.Forms.Timer { Interval = 3000 };
+                watchdog.Tick += (_, _) =>
+                {
+                    try
+                    {
+                        if (_fullscreen && !cw.ContainsFullScreenElement) SetFullscreen(false);
+                        _ = cw.ExecuteScriptAsync(
+                            $"window.__amEnsure && window.__amEnsure({(_fullscreen ? "false" : "true")})");
+                    }
+                    catch { }
+                };
+                watchdog.Start();
             }
             catch (Exception ex)
             {
@@ -368,10 +385,12 @@ class MainForm : Form
     int HitTestFrame(Point c)
     {
         if (!Framed || c.Y >= TopStrip || c.Y < 0) return HTCLIENT;
-        int corner = Scale(12);
+        int corner = Scale(14);
         if (c.X < corner) return HTTOPLEFT;
         if (c.X >= ClientSize.Width - corner) return HTTOPRIGHT;
-        return HTTOP;
+        // native caption: drag, double-click-maximize and right-click menu always work,
+        // independent of the injected page controls
+        return HTCAPTION;
     }
 
     static Point PointFromLParam(IntPtr lParam) =>
@@ -407,6 +426,11 @@ class MainForm : Form
                 if (ht != HTCLIENT) { m.Result = (IntPtr)ht; return; }
                 break;
             }
+
+            case WM_NCRBUTTONUP when (int)m.WParam == HTCAPTION:
+                ShowSystemMenuAtCursor();
+                m.Result = IntPtr.Zero;
+                return;
         }
         base.WndProc(ref m);
     }
@@ -524,6 +548,24 @@ class MainForm : Form
                 b.classList.toggle('amg-on', !!v);
                 b.title = v ? 'Nicht mehr im Vordergrund halten' : 'Immer im Vordergrund';
             }
+        };
+        // self-heal: called by the host every few seconds
+        window.__amEnsure = function (visible) {
+            try {
+                if (!root.isConnected && document.body) document.body.appendChild(root);
+                root.style.display = visible ? '' : 'none';
+                root.style.pointerEvents = ''; // never leave a stuck hit-test disable behind
+                if (!visible || document.fullscreenElement) return;
+                var c = document.getElementById('amg-right');
+                if (!c) return;
+                var r = c.getBoundingClientRect();
+                if (!r.width) return;
+                var cx = Math.min(Math.max(r.left + r.width / 2, 1), window.innerWidth - 2);
+                var cy = Math.min(Math.max(r.top + r.height / 2, 1), window.innerHeight - 2);
+                var hit = document.elementFromPoint(cx, cy);
+                // something covers the window controls -> re-append last so we win the stacking tie
+                if (hit && !root.contains(hit) && document.body) document.body.appendChild(root);
+            } catch (e) { }
         };
 
         // dynamic position: dodge page icons that live in the top-right corner.
